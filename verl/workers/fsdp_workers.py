@@ -901,6 +901,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                             student_module=self.actor_module_fsdp,
                             mix_coef=self_distillation_cfg.get("teacher_update_rate", 0.0),
                         )
+                    elif teacher_regularization in ("frozen", "ema", "periodic"):
+                        # For frozen/ema/periodic, teacher uses the ref module directly
+                        # frozen: ref weights never updated
+                        # ema: ref weights updated via EMA in dp_actor._update_teacher
+                        # periodic: ref weights fully copied every N steps in dp_actor._update_teacher
+                        self.actor.teacher_module = self.ref_module_fsdp
                     else:
                         self.actor.teacher_module = self.ref_module_fsdp
 

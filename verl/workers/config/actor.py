@@ -44,8 +44,11 @@ class SelfDistillationConfig(BaseConfig):
         full_logit_distillation (bool): Whether to use full-logit KL distillation.
         alpha (float): KL interpolation coefficient. 0.0=forward KL, 1.0=reverse KL, in-between=JSD.
         success_reward_threshold (float): Minimum sequence reward to be considered successful.
-        teacher_regularization (str): Teacher regularization mode. Options: "ema", "trust-region".
+        teacher_regularization (str): Teacher regularization mode. Options: "ema", "trust-region", "frozen", "periodic".
         teacher_update_rate (float): EMA update rate for teacher weights, or trust-region mixing coefficient.
+            Set to 0.0 for frozen teacher, 1.0 for periodic full copy.
+        teacher_update_interval (int): For "periodic" mode, copy student weights to teacher every N steps.
+        early_stop_kl_threshold (float): If teacher-student mean KL < this, stop training (0 = disabled).
         distillation_topk (Optional[int]): If set, use top-k logits for distillation.
         distillation_add_tail (bool): Whether to add a tail bucket for top-k distillation.
         max_reprompt_len (int): Maximum length of the reprompted prompt.
@@ -58,8 +61,18 @@ class SelfDistillationConfig(BaseConfig):
         feedback_template (str): Template for formatting feedback section. Uses {feedback_raw} placeholder.
         include_environment_feedback (bool): Whether to include environment feedback in reprompting for wrong attempts.
         environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is available (ignore feedback when solution exists).
-        reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
-        reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
+
+        # --- Few-shot Context Distillation (OPCD) ---
+        distillation_mode (str): "sdpo" for original SDPO reprompt logic, "few_shot" for few-shot context distillation.
+        few_shot_k (int): Number of few-shot examples per query.
+        few_shot_placement (str): Where to place few-shot examples: "system" or "message".
+        few_shot_dev_data (str): Path to dev_data.json (candidate example pool).
+        few_shot_dev_msg_data (str): Path to essay_sampling_reasoning.jsonl (with messages + parse_pred/ground_t).
+        few_shot_filter_correct_only (bool): Only select examples where teacher predicted correctly.
+        few_shot_train_distance_matrix (str): Path to dev×dev distance matrix (.npy) for training.
+        few_shot_eval_distance_matrix (str): Path to test×dev distance matrix (.npy) for evaluation.
+        few_shot_sys_prompt_template (Optional[str]): Custom system prompt template.
+        pure_distillation (bool): If True, skip reward filtering — all queries are distilled (Mode A).
     """
 
     full_logit_distillation: bool = True
@@ -67,6 +80,8 @@ class SelfDistillationConfig(BaseConfig):
     success_reward_threshold: float = 1.0
     teacher_regularization: str = "ema"
     teacher_update_rate: float = 0.05
+    teacher_update_interval: int = 10
+    early_stop_kl_threshold: float = 0.0
     distillation_topk: Optional[int] = None
     distillation_add_tail: bool = True
     max_reprompt_len: int = 10240
@@ -91,10 +106,22 @@ class SelfDistillationConfig(BaseConfig):
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
 
+    # --- Few-shot Context Distillation (OPCD) ---
+    distillation_mode: str = "sdpo"  # "sdpo" (original) or "few_shot" (OPCD)
+    few_shot_k: int = 30
+    few_shot_placement: str = "message"  # "system" or "message"
+    few_shot_dev_data: Optional[str] = None
+    few_shot_dev_msg_data: Optional[str] = None
+    few_shot_filter_correct_only: bool = True
+    few_shot_train_distance_matrix: Optional[str] = None
+    few_shot_eval_distance_matrix: Optional[str] = None
+    few_shot_sys_prompt_template: Optional[str] = None
+    pure_distillation: bool = False  # True = Mode A (all queries distilled, no reward filtering)
+
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
-        valid_teacher_regularization = ["ema", "trust-region"]
+        valid_teacher_regularization = ["ema", "trust-region", "frozen", "periodic"]
         if self.teacher_regularization not in valid_teacher_regularization:
             raise ValueError(
                 "self_distillation.teacher_regularization must be one of "
@@ -104,12 +131,24 @@ class SelfDistillationConfig(BaseConfig):
             raise ValueError(
                 f"self_distillation.teacher_update_rate must be in [0,1], got {self.teacher_update_rate}"
             )
+        if self.teacher_update_interval < 1:
+            raise ValueError(
+                f"self_distillation.teacher_update_interval must be >= 1, got {self.teacher_update_interval}"
+            )
         if self.distillation_topk is not None and self.distillation_topk <= 0:
             raise ValueError(
                 f"self_distillation.distillation_topk must be a positive integer, got {self.distillation_topk}"
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+        if self.distillation_mode not in ("sdpo", "few_shot"):
+            raise ValueError(
+                f"self_distillation.distillation_mode must be 'sdpo' or 'few_shot', got {self.distillation_mode}"
+            )
+        if self.few_shot_placement not in ("system", "message"):
+            raise ValueError(
+                f"self_distillation.few_shot_placement must be 'system' or 'message', got {self.few_shot_placement}"
+            )
 
 
 @dataclass

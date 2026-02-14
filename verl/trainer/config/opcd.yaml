@@ -1,0 +1,74 @@
+# OPCD (Online Predictive Context Distillation) Configuration
+# Based on SDPO config, modified for few-shot context distillation
+#
+# Teacher: frozen model with few-shot examples (per-query dynamic selection via Neuron Similarity)
+# Student: trainable model with zero-shot prompt
+# Loss: KL divergence (JSD by default) between teacher and student logits on student trajectory
+
+defaults:
+  - ppo_trainer
+  - user
+  - _self_
+
+# Shorter context: no feedback/reprompt, just few-shot + generation
+# MAX_PROMPT_LENGTH=2048
+# FEW_SHOT_LENGTH=8192  (30 examples * ~270 tokens each)
+# MAX_RESPONSE_LENGTH=512
+max_model_len: 12288
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 32
+    policy_loss:
+      loss_mode: sdpo  # reuse SDPO's distillation loss infrastructure
+    self_distillation:
+      # --- Core: Few-shot Context Distillation ---
+      distillation_mode: few_shot
+      pure_distillation: true         # Mode A: all queries distilled
+
+      # --- Teacher config: frozen ---
+      teacher_regularization: frozen
+      teacher_update_rate: 0.0
+
+      # --- Few-shot selection ---
+      few_shot_k: 30
+      few_shot_placement: message     # "system" or "message"
+      few_shot_filter_correct_only: true
+      # Set these paths for your dataset:
+      # few_shot_dev_data: data/essay_comment/dev_data.json
+      # few_shot_dev_msg_data: path/to/essay_sampling_reasoning.jsonl
+      # few_shot_train_distance_matrix: path/to/dev_x_dev/query_x_candidate.npy
+      # few_shot_eval_distance_matrix: path/to/test_x_dev/query_x_candidate.npy
+
+      # --- Distillation hyperparams ---
+      full_logit_distillation: true
+      alpha: 0.5                      # JSD (try 0.0 for forward KL, 1.0 for reverse KL)
+      distillation_topk: 100          # top-k logit distillation to save memory
+      distillation_add_tail: true
+      is_clip: 2.0
+      max_reprompt_len: 10240
+
+      # --- Disable SDPO-specific features ---
+      include_environment_feedback: false
+      dont_reprompt_on_self_success: true
+
+    optim:
+      lr: 1e-5
+      lr_warmup_steps: 10
+
+  rollout:
+    n: 1                              # single generation per query (no multi-rollout needed)
+    calculate_log_probs: True
+    temperature: 0.7
+
+algorithm:
+  adv_estimator: grpo  # disables critic
+  norm_adv_by_std_in_grpo: False
+
+data:
+  train_batch_size: 32
+
+trainer:
+  total_training_steps: 50            # OPCD paper uses ~50 steps
+  val_before_train: True
+  val_freq: 5

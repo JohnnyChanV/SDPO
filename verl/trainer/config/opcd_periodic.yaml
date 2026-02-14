@@ -1,0 +1,18 @@
+# OPCD with Periodic Teacher Update (Recursive Distillation)
+#
+# Same as OPCD but teacher is periodically updated by copying student weights.
+# This allows iterative refinement: student learns from few-shot teacher,
+# then the updated student becomes the new teacher for the next round.
+
+defaults:
+  - opcd
+  - _self_
+
+actor_rollout_ref:
+  actor:
+    self_distillation:
+      # --- Periodic teacher update ---
+      teacher_regularization: periodic
+      teacher_update_rate: 1.0          # full copy (not EMA)
+      teacher_update_interval: 10       # copy every 10 steps
+      early_stop_kl_threshold: 0.01     # stop if KL < 0.01

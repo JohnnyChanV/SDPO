@@ -46,6 +46,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.few_shot_utils import FewShotManager
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -375,6 +376,24 @@ class RayPPOTrainer:
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
+        # Initialize FewShotManager if using few-shot context distillation
+        self.few_shot_manager = None
+        sd_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
+        if sd_cfg is not None and sd_cfg.get("distillation_mode") == "few_shot":
+            dev_data_path = sd_cfg.get("few_shot_dev_data")
+            dev_msg_path = sd_cfg.get("few_shot_dev_msg_data")
+            if dev_data_path and dev_msg_path:
+                self.few_shot_manager = FewShotManager(
+                    dev_data_path=dev_data_path,
+                    dev_msg_data_path=dev_msg_path,
+                    train_distance_matrix_path=sd_cfg.get("few_shot_train_distance_matrix"),
+                    eval_distance_matrix_path=sd_cfg.get("few_shot_eval_distance_matrix"),
+                    k=sd_cfg.get("few_shot_k", 30),
+                    placement=sd_cfg.get("few_shot_placement", "message"),
+                    filter_correct_only=sd_cfg.get("few_shot_filter_correct_only", True),
+                    sys_prompt_template=sd_cfg.get("few_shot_sys_prompt_template"),
+                )
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
@@ -680,6 +699,120 @@ class RayPPOTrainer:
         if self_distillation_cfg is None or loss_mode != "sdpo":
             return None
 
+        distillation_mode = self_distillation_cfg.get("distillation_mode", "sdpo")
+
+        if distillation_mode == "few_shot":
+            return self._build_few_shot_distillation_batch(batch, reward_tensor, self_distillation_cfg)
+        else:
+            return self._build_sdpo_distillation_batch(batch, reward_tensor, reward_extra_infos_dict, self_distillation_cfg)
+
+    def _build_few_shot_distillation_batch(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        self_distillation_cfg,
+    ) -> Optional[tuple[DataProto, dict[str, float]]]:
+        """
+        Build teacher prompt using few-shot examples (Context Distillation / OPCD mode).
+
+        Teacher gets few-shot examples + query; student gets query only (zero-shot).
+        The few-shot examples are selected per-query using Neuron Similarity (Jaccard distance).
+        """
+        if self.few_shot_manager is None:
+            raise ValueError(
+                "FewShotManager not initialized. Make sure few_shot_dev_data and few_shot_dev_msg_data "
+                "are set in self_distillation config when distillation_mode='few_shot'."
+            )
+
+        device = batch.batch["input_ids"].device
+        response_mask = batch.batch["response_mask"]
+        responses = batch.batch["responses"]
+        batch_size = batch.batch.batch_size[0]
+
+        pure_distillation = self_distillation_cfg.get("pure_distillation", False)
+
+        # Build teacher messages with few-shot examples for each query
+        messages = []
+        for i in range(batch_size):
+            raw_prompt = batch.non_tensor_batch["raw_prompt"][i]
+            # Extract the Comment from the user message
+            user_msg = raw_prompt[-1]["content"] if raw_prompt else ""
+            # Build a query dict compatible with FewShotManager
+            query = {"Comment": user_msg}
+
+            # Use query index from batch if available, else use positional index
+            query_idx = i
+            if "query_idx" in batch.non_tensor_batch:
+                query_idx = int(batch.non_tensor_batch["query_idx"][i])
+
+            teacher_msgs = self.few_shot_manager.get_teacher_messages(
+                query=query, query_idx=query_idx, mode="train"
+            )
+            messages.append(teacher_msgs)
+
+        enable_thinking = (
+            self.config.data.apply_chat_template_kwargs.get("enable_thinking", True)
+            if self.config.data.apply_chat_template_kwargs else True
+        )
+        teacher_prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            return_tensors="pt",
+            return_dict=True,
+            continue_final_message=False,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+            max_length=self_distillation_cfg.max_reprompt_len,
+            padding=True,
+            truncation=True,
+        )
+
+        # Token-level alignment: concatenate teacher prompt tokens with student generation tokens
+        # This ensures the generation portion is identical between teacher and student
+        teacher_input_ids = torch.cat([teacher_prompt["input_ids"].to(device), responses], dim=1)
+        teacher_attention_mask = torch.cat([teacher_prompt["attention_mask"].to(device), response_mask], dim=1)
+        teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
+
+        if pure_distillation:
+            # Mode A: all queries are distilled, no reward filtering
+            self_distillation_mask = torch.ones(batch_size, dtype=torch.float32, device=device)
+        else:
+            # Mode B: only distill when teacher (few-shot) is better than student (zero-shot)
+            # For now, use reward threshold to filter
+            seq_scores = reward_tensor.sum(dim=-1).detach().cpu().numpy()
+            threshold = self_distillation_cfg.get("success_reward_threshold", 0.0)
+            # Distill all samples where student didn't get perfect score
+            # (i.e., teacher can potentially help)
+            self_distillation_mask = torch.tensor(
+                [1.0 if seq_scores[i] < threshold else 0.0 for i in range(batch_size)],
+                dtype=torch.float32,
+                device=device,
+            )
+
+        metrics = {
+            "self_distillation/mode": 1.0,  # 1.0 = few_shot mode
+            "self_distillation/few_shot_k": float(self_distillation_cfg.get("few_shot_k", 30)),
+            "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
+            "self_distillation/pure_distillation": float(pure_distillation),
+        }
+        return DataProto.from_dict(tensors={
+            "teacher_input_ids": teacher_input_ids,
+            "teacher_attention_mask": teacher_attention_mask,
+            "teacher_position_ids": teacher_position_ids,
+            "self_distillation_mask": self_distillation_mask,
+        }), metrics
+
+    def _build_sdpo_distillation_batch(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        reward_extra_infos_dict: Optional[dict[str, list]],
+        self_distillation_cfg,
+    ) -> Optional[tuple[DataProto, dict[str, float]]]:
+        """
+        Original SDPO reprompt-based distillation batch construction.
+        Teacher prompt = original prompt + solution/feedback from successful rollouts.
+        """
         device = batch.batch["input_ids"].device
         response_mask = batch.batch["response_mask"]
         responses = batch.batch["responses"]
@@ -1489,6 +1622,8 @@ class RayPPOTrainer:
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
+        # Pass global_step for periodic teacher update in dp_actor._update_teacher
+        batch.meta_info["global_step"] = self.global_steps
         # update actor
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()

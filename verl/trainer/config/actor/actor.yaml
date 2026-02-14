@@ -98,11 +98,18 @@ self_distillation:
   # Minimum sequence reward to be considered successful
   success_reward_threshold: 0.5
 
-  # Teacher regularization method: "ema" or "trust-region"
+  # Teacher regularization method: "ema", "trust-region", "frozen", or "periodic"
   teacher_regularization: ema
 
   # EMA update rate for teacher weights, or trust-region mixing coefficient
-  teacher_update_rate: 0.05 
+  # Set to 0.0 for frozen, 1.0 for periodic full copy
+  teacher_update_rate: 0.05
+
+  # For "periodic" mode: copy student weights to teacher every N steps
+  teacher_update_interval: 10
+
+  # Early stop: if teacher-student mean KL < threshold, stop training (0 = disabled)
+  early_stop_kl_threshold: 0.0
 
   # Maximum length of the reprompted prompt
   max_reprompt_len: 10240
@@ -146,6 +153,38 @@ self_distillation:
     The following is feedback from your unsuccessful earlier attempt:
 
     {feedback_raw}
+
+  # --- Few-shot Context Distillation (OPCD) ---
+
+  # Distillation mode: "sdpo" (original reprompt) or "few_shot" (context distillation)
+  distillation_mode: sdpo
+
+  # Number of few-shot examples per query
+  few_shot_k: 30
+
+  # Where to place few-shot examples: "system" (in system prompt) or "message" (as multi-turn messages)
+  few_shot_placement: message
+
+  # Path to dev_data.json (candidate example pool with Comment, label fields)
+  few_shot_dev_data: null
+
+  # Path to essay_sampling_reasoning.jsonl (with messages, parse_pred, ground_t fields)
+  few_shot_dev_msg_data: null
+
+  # Only select examples where teacher predicted correctly
+  few_shot_filter_correct_only: true
+
+  # Path to dev×dev Jaccard distance matrix (.npy) for training
+  few_shot_train_distance_matrix: null
+
+  # Path to test×dev Jaccard distance matrix (.npy) for evaluation
+  few_shot_eval_distance_matrix: null
+
+  # Custom system prompt template (null = use default)
+  few_shot_sys_prompt_template: null
+
+  # Pure distillation (Mode A): all queries distilled, no reward filtering
+  pure_distillation: false
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
