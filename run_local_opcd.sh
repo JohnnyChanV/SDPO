@@ -16,7 +16,7 @@ CONFIG_NAME="opcd"
 DATA_PATH="datasets/essay_comment"
 
 # Model
-MODEL_PATH="Qwen/Qwen3-4B"
+MODEL_PATH="Qwen/Qwen3-4B-Thinking-2507"
 
 # Hyperparameters
 TRAIN_BATCH_SIZE=32
@@ -28,12 +28,12 @@ TOTAL_STEPS=50
 TEACHER_MODE="frozen"        # "frozen", "ema", "periodic"
 
 # Few-shot data paths (MUST set these for your dataset)
-FEW_SHOT_DEV_DATA=""         # e.g., data/essay_comment/dev_data.json
-FEW_SHOT_DEV_MSG_DATA=""     # e.g., path/to/essay_sampling_reasoning.jsonl
-TRAIN_DIST_MATRIX=""         # e.g., path/to/dev_x_dev/query_x_candidate.npy
-EVAL_DIST_MATRIX=""          # e.g., path/to/test_x_dev/query_x_candidate.npy
+FEW_SHOT_DEV_DATA="data/essay_comment/dev_data.json"         # e.g., data/essay_comment/dev_data.json
+FEW_SHOT_DEV_MSG_DATA="msg_data/essay_sampling_reasoning.jsonl"     # e.g., path/to/essay_sampling_reasoning.jsonl
+TRAIN_DIST_MATRIX="msg_data_jc_dists/essay_test_sampling_reasoning--qwen3-4b-instruct-2507--essay_sampling_reasoning--qwen3-4b-instruct-2507/candidate_x_candidate.npy"         # e.g., path/to/dev_x_dev/query_x_candidate.npy
+EVAL_DIST_MATRIX="msg_data_jc_dists/essay_test_sampling_reasoning--qwen3-4b-instruct-2507--essay_sampling_reasoning--qwen3-4b-instruct-2507/query_x_candidate.npy"          # e.g., path/to/test_x_dev/query_x_candidate.npy
 
-export N_GPUS_PER_NODE=1
+export N_GPUS_PER_NODE=4
 
 # Allow overriding experiment name suffix
 SUFFIX=${1:-"local_opcd"}

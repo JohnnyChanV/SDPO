@@ -1165,6 +1165,12 @@ def compute_self_distillation_loss(
         log_ratio = student_log_probs - teacher_log_probs
         per_token_loss = log_ratio.detach() * student_log_probs
 
+    # Log unweighted divergence for early-stop decisions.
+    valid_tokens = loss_mask.sum().clamp(min=1.0)
+    metrics["self_distillation/teacher_student_kl"] = (
+        (per_token_loss.detach() * loss_mask).sum() / valid_tokens
+    ).item()
+
     is_clip = self_distillation_config.is_clip
     if is_clip is not None:
         if old_log_probs is None:

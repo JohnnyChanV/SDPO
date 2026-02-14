@@ -46,7 +46,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
-from verl.trainer.ppo.few_shot_utils import FewShotManager
+from verl.trainer.ppo.few_shot_utils import FewShotManager, extract_comment_text_from_user_content
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -735,10 +735,11 @@ class RayPPOTrainer:
         messages = []
         for i in range(batch_size):
             raw_prompt = batch.non_tensor_batch["raw_prompt"][i]
-            # Extract the Comment from the user message
+            # Extract the raw comment from the last user content.
             user_msg = raw_prompt[-1]["content"] if raw_prompt else ""
+            comment_text = extract_comment_text_from_user_content(user_msg)
             # Build a query dict compatible with FewShotManager
-            query = {"Comment": user_msg}
+            query = {"Comment": comment_text}
 
             # Use query index from batch if available, else use positional index
             query_idx = i
@@ -1746,6 +1747,7 @@ class RayPPOTrainer:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
+                early_stop_this_step = False
                 timing_raw = {}
 
                 with marked_timer("start_profile", timing_raw):
@@ -1981,6 +1983,16 @@ class RayPPOTrainer:
                             actor_output = self._update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        # Optional early-stop based on teacher-student KL.
+                        sd_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", None)
+                        loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+                        if sd_cfg is not None and loss_mode == "sdpo":
+                            kl_threshold = float(sd_cfg.get("early_stop_kl_threshold", 0.0))
+                            kl_metric = metrics.get("self_distillation/teacher_student_kl", None)
+                            if kl_threshold > 0.0 and kl_metric is not None and float(kl_metric) < kl_threshold:
+                                early_stop_this_step = True
+                                metrics["self_distillation/early_stop_triggered"] = 1.0
+                                metrics["self_distillation/early_stop_threshold"] = kl_threshold
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -2062,6 +2074,14 @@ class RayPPOTrainer:
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
+                if early_stop_this_step:
+                    pprint(
+                        "Early stopping triggered: "
+                        f"teacher-student KL {metrics.get('self_distillation/teacher_student_kl')} "
+                        f"< threshold {metrics.get('self_distillation/early_stop_threshold')}"
+                    )
+                    progress_bar.close()
+                    return
                 self.global_steps += 1
 
                 if (

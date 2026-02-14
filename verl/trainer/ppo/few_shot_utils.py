@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -139,20 +140,57 @@ def build_few_shot_cache(
     """
     cache: dict[int, list[int]] = {}
     for q in range(num_queries):
-        examples = select_few_shot_examples(
-            query_idx=q,
-            k=k,
-            distance_matrix=distance_matrix,
-            dev_msg_data=dev_msg_data,
-            filter_correct_only=filter_correct_only,
-            exclude_self=exclude_self,
-        )
-        # Store indices rather than full dicts to save memory
-        # We'll look them up from dev_msg_data at prompt construction time
-        # For now, just store the examples themselves in the list
-        cache[q] = examples
+        dists = distance_matrix[q].copy()
+        if exclude_self and q < len(dists):
+            dists[q] = np.inf
+        nearest_ids = np.argsort(dists)
+        selected_ids: list[int] = []
+        cursor = 0
+        while len(selected_ids) < k and cursor < len(nearest_ids):
+            cand_idx = int(nearest_ids[cursor])
+            cursor += 1
+            candidate = dev_msg_data[cand_idx]
+            if filter_correct_only:
+                pred = candidate.get("parse_pred")
+                gt = candidate.get("ground_t")
+                if pred is None or gt is None or pred != gt:
+                    continue
+            selected_ids.append(cand_idx)
+        cache[q] = selected_ids
     logger.info("Built few-shot cache for %d queries (k=%d)", num_queries, k)
     return cache
+
+
+def maybe_transpose_distance_matrix(distance_matrix: np.ndarray, num_candidates: int) -> np.ndarray:
+    """Ensure distance matrix has shape (num_query, num_candidate)."""
+    if distance_matrix.ndim != 2:
+        raise ValueError(f"Distance matrix must be 2D, got shape={distance_matrix.shape}")
+    if distance_matrix.shape[1] == num_candidates:
+        return distance_matrix
+    if distance_matrix.shape[0] == num_candidates:
+        logger.warning(
+            "Distance matrix shape %s appears transposed; auto-transposing to align axis-1 with candidates=%d.",
+            distance_matrix.shape,
+            num_candidates,
+        )
+        return distance_matrix.T
+    raise ValueError(
+        "Distance matrix candidate axis mismatch. "
+        f"shape={distance_matrix.shape}, expected axis-1 or axis-0 to equal num_candidates={num_candidates}"
+    )
+
+
+def extract_comment_text_from_user_content(user_content: str) -> str:
+    """Extract raw comment text from a user message like 'The Comment is: ...'."""
+    if not isinstance(user_content, str):
+        return ""
+    text = user_content.strip()
+    # Handle common prompt forms:
+    # - "The Comment is: ..."
+    # - "Comment: ..."
+    # - plain raw comment text
+    pattern = re.compile(r"^\s*(the\s+comment\s+is|comment)\s*:\s*", flags=re.IGNORECASE)
+    return pattern.sub("", text, count=1).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -321,15 +359,19 @@ class FewShotManager:
         self.eval_dist_matrix: Optional[np.ndarray] = None
 
         if train_distance_matrix_path and Path(train_distance_matrix_path).exists():
-            self.train_dist_matrix = load_distance_matrix(train_distance_matrix_path)
+            self.train_dist_matrix = maybe_transpose_distance_matrix(
+                load_distance_matrix(train_distance_matrix_path), num_candidates=len(self.dev_msg_data)
+            )
         if eval_distance_matrix_path and Path(eval_distance_matrix_path).exists():
-            self.eval_dist_matrix = load_distance_matrix(eval_distance_matrix_path)
+            self.eval_dist_matrix = maybe_transpose_distance_matrix(
+                load_distance_matrix(eval_distance_matrix_path), num_candidates=len(self.dev_msg_data)
+            )
 
         # Pre-build caches
-        self._train_cache: Optional[dict[int, list[dict]]] = None
-        self._eval_cache: Optional[dict[int, list[dict]]] = None
+        self._train_cache: Optional[dict[int, list[int]]] = None
+        self._eval_cache: Optional[dict[int, list[int]]] = None
 
-    def _get_or_build_cache(self, mode: str = "train") -> dict[int, list[dict]]:
+    def _get_or_build_cache(self, mode: str = "train") -> dict[int, list[int]]:
         if mode == "train":
             if self._train_cache is None and self.train_dist_matrix is not None:
                 num_q = self.train_dist_matrix.shape[0]
@@ -373,7 +415,8 @@ class FewShotManager:
             List of message dicts for the teacher prompt.
         """
         cache = self._get_or_build_cache(mode)
-        examples = cache.get(query_idx, [])
+        example_ids = cache.get(query_idx, [])
+        examples = [self.dev_msg_data[eid] for eid in example_ids]
 
         if self.placement == "system":
             return build_teacher_prompt_system(
